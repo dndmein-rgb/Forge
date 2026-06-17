@@ -16,7 +16,7 @@ const WorkSpacePage = async ({ searchParams }: WorkspacePageProps) => {
   return (
     <div>
       
-        <WorkspaceClient />
+        <WorkspaceClient initialPrompt={prompt ?? ""} userCredits={10} userId={userId} userPlan={"free"} />
     </div>
   );
 };
