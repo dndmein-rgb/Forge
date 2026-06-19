@@ -2,6 +2,9 @@ import "dotenv/config";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "./generated/prisma/client";
 
+import dns from "dns"
+dns.setServers(['1.1.1.1','8.8.8.8'])
+
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined;
 };

@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { ThemeProvider } from "@/components/theme-provider";
 import Header from "@/components/header";
 import { ClerkProvider } from "@clerk/nextjs";
+import { Toaster } from "@/components/ui/sonner";
 
 const lora = Lora({
   subsets: ["latin"],
@@ -32,9 +33,9 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
+         <ClerkProvider>
     <html lang="en" suppressHydrationWarning>
       <body className={`${lora.variable} ${dmSans.variable} font-sans`}>
-         <ClerkProvider>
          <ThemeProvider
             attribute="class"
             defaultTheme="dark"
@@ -43,9 +44,10 @@ export default function RootLayout({
           >
             <Header />
         <main> {children} </main>
+        <Toaster richColors />
         </ThemeProvider>
-        </ClerkProvider>
       </body>
     </html>
+        </ClerkProvider>
   );
 }
