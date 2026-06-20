@@ -1,9 +1,12 @@
 import "dotenv/config";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "./generated/prisma/client";
+import dns from 'dns'
 
-import dns from "dns"
-dns.setServers(['1.1.1.1','8.8.8.8'])
+// Overriding DNS before Prisma attempts to connect
+if (process.env.NODE_ENV === 'development') {
+  dns.setServers(['1.1.1.1', '8.8.8.8'])
+}
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined;

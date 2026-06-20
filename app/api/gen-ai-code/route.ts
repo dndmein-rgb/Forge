@@ -4,7 +4,7 @@ import { GoogleGenAI } from "@google/genai";
 import { db } from "@/lib/prisma";
 import { CREDIT_COST_PER_GENERATION } from "@/lib/constants";
 import type { Message, FileData } from "@/types/workspace";
-// import { aj } from "@/lib/arcjet";
+import { aj } from "@/lib/arcjet";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 
@@ -34,21 +34,28 @@ function extractThoughtLabel(text: string): string | null {
 
 async function validateDependencies(
   deps: Record<string, string>
-): Promise<Record<string, string>> {
+): Promise<{ valid: Record<string, string>; dropped: string[] }> {
   const valid: Record<string, string> = {};
+  const dropped: string[] = [];
+
   await Promise.all(
     Object.entries(deps).map(async ([pkg, version]) => {
       try {
         const res = await fetch(`https://registry.npmjs.org/${pkg}/latest`, {
           signal: AbortSignal.timeout(1500),
         });
-        if (res.ok) valid[pkg] = version;
+        if (res.ok) {
+          valid[pkg] = version;
+        } else {
+          dropped.push(pkg);
+        }
       } catch {
-        // silently skip hallucinated packages
+        dropped.push(pkg);
       }
     })
   );
-  return valid;
+
+  return { valid, dropped };
 }
 
 // ─── History trimming ─────────────────────────────────────────────────────────
@@ -126,11 +133,16 @@ export async function POST(request: NextRequest) {
   }
 
   const body = await request.json();
-  const { workspaceId, userId, messages, fileData } = body as {
+  const { workspaceId, messages, fileData } = body as {
     workspaceId: string | null;
-    userId: string;
     messages: Message[];
     fileData: FileData | null;
+    // `userId` is intentionally NOT destructured from the request body.
+    // It must always come from the authenticated `clerkId` lookup below —
+    // never from client input. Trusting a body-supplied userId is what
+    // caused the `Workspace_userId_fkey` violation: the client was sending
+    // an id that doesn't exist in `User`, and workspace.create() tried to
+    // insert a workspace pointing at it.
   };
 
   if (!messages?.length) {
@@ -138,31 +150,35 @@ export async function POST(request: NextRequest) {
   }
 
   // ── Arcjet: rate limit, prompt injection, sensitive info ──────────────────
-  // detectPromptInjectionMessage requires the actual user text to inspect.
+  // (currently disabled upstream — re-enable by uncommenting the import
+  // and the block below)
 
-  // const arcjetReq = new Request(request.url, {
-  //   method: request.method,
-  //   headers: request.headers,
-  //   body: JSON.stringify(body),
-  // });
+  const arcjetReq = new Request(request.url, {
+    method: request.method,
+    headers: request.headers,
+    body: JSON.stringify(body),
+  });
 
-  // const lastUserMessage =
-  //   [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
-  // const decision = await aj.protect(arcjetReq, {
-  //   requested: 1,
-  //   userId: clerkId,
-  //   detectPromptInjectionMessage: lastUserMessage,
-  // });
+  const lastUserMessageContent =
+    [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
 
-  // if (decision.isDenied()) {
-  //   return Response.json(
-  //     { message: decision.reason?.type ?? "Request blocked" },
-  //     { status: 429 }
-  //   );
-  // }
+  const decision = await aj.protect(arcjetReq, {
+    requested: 1,
+    userId: clerkId,
+    detectPromptInjectionMessage: lastUserMessageContent,
+  });
+
+  if (decision.isDenied()) {
+    return Response.json(
+      { message: decision.reason?.type ?? "Request blocked" },
+      { status: 429 }
+    );
+  }
+
+  // ── Resolve the internal user record from the AUTHENTICATED clerkId only ──
 
   const user = await db.user.findUnique({
-    where: {  clerkId },
+    where: { clerkId },
     select: { id: true, credits: true },
   });
 
@@ -172,18 +188,42 @@ export async function POST(request: NextRequest) {
     return Response.json({ message: "Insufficient credits" }, { status: 402 });
   }
 
+  const userId = user.id; // ← the ONLY userId used anywhere below
+
+  // ── If updating an existing workspace, verify ownership up front ──────────
+  // Fails fast with 404 instead of throwing a Prisma error deep inside the
+  // transaction after an expensive Gemini call has already run.
+
+  if (workspaceId) {
+    const owned = await db.workspace.findFirst({
+      where: { id: workspaceId, userId },
+      select: { id: true },
+    });
+    if (!owned) {
+      return Response.json({ message: "Workspace not found" }, { status: 404 });
+    }
+  }
+
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
     async start(controller) {
-      const enqueue = (chunk: string) =>
-        controller.enqueue(encoder.encode(chunk));
+      let closed = false;
+
+      const enqueue = (chunk: string) => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(chunk));
+        } catch {
+          closed = true;
+        }
+      };
 
       try {
         const contents = buildContents(messages, fileData);
 
         const geminiStream = await ai.models.generateContentStream({
-          model: "gemini-3.5-flash",
+          model: "gemini-2.5-flash",
           contents,
           config: {
             systemInstruction: SYSTEM_PROMPT,
@@ -205,7 +245,6 @@ export async function POST(request: NextRequest) {
             if (!part.text) continue;
 
             if (part.thought) {
-              // Extract just the short label — not the full wall of text
               const now = Date.now();
               if (now - lastEmitTime > 600) {
                 const label = extractThoughtLabel(part.text);
@@ -215,7 +254,6 @@ export async function POST(request: NextRequest) {
                 }
               }
             } else {
-              // Actual JSON output
               accumulated += part.text;
             }
           }
@@ -238,16 +276,12 @@ export async function POST(request: NextRequest) {
               message: "AI returned invalid JSON. Please try again.",
             })
           );
+          closed = true;
           controller.close();
           return;
         }
 
-        const {
-          assistantMessage,
-          title: aiTitle,
-          files,
-          dependencies,
-        } = parsed;
+        const { assistantMessage, title: aiTitle, files, dependencies } = parsed;
 
         if (!files || typeof files !== "object") {
           enqueue(
@@ -255,6 +289,7 @@ export async function POST(request: NextRequest) {
               message: "AI response missing files. Please try again.",
             })
           );
+          closed = true;
           controller.close();
           return;
         }
@@ -262,7 +297,18 @@ export async function POST(request: NextRequest) {
         // ── Validate npm packages ──────────────────────────────────────────────
 
         enqueue(sseEvent("status", { message: "Validating packages…" }));
-        const validatedDeps = await validateDependencies(dependencies ?? {});
+        const { valid: validatedDeps, dropped } = await validateDependencies(
+          dependencies ?? {}
+        );
+
+        if (dropped.length > 0) {
+          enqueue(
+            sseEvent("warning", {
+              message: `Skipped unknown package(s): ${dropped.join(", ")}`,
+            })
+          );
+        }
+
         const newFileData: FileData = {
           files,
           dependencies: validatedDeps,
@@ -279,29 +325,42 @@ export async function POST(request: NextRequest) {
           { role: "assistant", content: assistantMessage },
         ];
 
-        const workspace = await db.$transaction( async(tx)=>{
-        const ws=  workspaceId
-            ? await tx.workspace.update({
-                where: { id: workspaceId, userId },
-                data: {
-                  messages: updatedMessages as never,
-                  fileData: newFileData as never,
-                },
-              })
-            : await  tx.workspace.create({
-                data: {
-                  userId,
-                  title: aiTitle ?? lastUserMessage.content.slice(0, 80),
-                  messages: updatedMessages as never,
-                  fileData: newFileData as never,
-                },
-              })
-         await tx.user.update({
-            where: { id: userId },
-            data: { credits: { decrement: CREDIT_COST_PER_GENERATION } },
-          })
-          return ws;
-      },{timeout:200000});
+        const workspace = await db.$transaction(
+          async (tx) => {
+            const ws = workspaceId
+              ? await tx.workspace.update({
+                  // Ownership already verified above; `id` alone is the
+                  // unique key Prisma needs here.
+                  where: { id: workspaceId },
+                  data: {
+                    messages: updatedMessages as never,
+                    fileData: newFileData as never,
+                  },
+                })
+              : await tx.workspace.create({
+                  data: {
+                    userId, // ← resolved from clerkId, guaranteed to exist
+                    title: aiTitle ?? lastUserMessage.content.slice(0, 80),
+                    messages: updatedMessages as never,
+                    fileData: newFileData as never,
+                  },
+                });
+
+            // Guard against the credit balance changing between the
+            // earlier check and now (e.g. a concurrent request).
+            const creditUpdate = await tx.user.updateMany({
+              where: { id: userId, credits: { gte: CREDIT_COST_PER_GENERATION } },
+              data: { credits: { decrement: CREDIT_COST_PER_GENERATION } },
+            });
+
+            if (creditUpdate.count === 0) {
+              throw new Error("INSUFFICIENT_CREDITS");
+            }
+
+            return ws;
+          },
+          { timeout: 20000 } // 20s, not 200s — see note below
+        );
 
         const updatedUser = await db.user.findUnique({
           where: { id: userId },
@@ -320,14 +379,25 @@ export async function POST(request: NextRequest) {
           })
         );
       } catch (err) {
-        console.error("[gen-ai-code] stream error:", err);
-        enqueue(
-          sseEvent("error", {
-            message: "Something went wrong. Please try again.",
-          })
-        );
+        if (err instanceof Error && err.message === "INSUFFICIENT_CREDITS") {
+          enqueue(
+            sseEvent("error", {
+              message: "Insufficient credits. Please try again.",
+            })
+          );
+        } else {
+          console.error("[gen-ai-code] stream error:", err);
+          enqueue(
+            sseEvent("error", {
+              message: "Something went wrong. Please try again.",
+            })
+          );
+        }
       } finally {
-        controller.close();
+        if (!closed) {
+          closed = true;
+          controller.close();
+        }
       }
     },
   });
@@ -342,4 +412,4 @@ export async function POST(request: NextRequest) {
 }
 
 export const runtime = "nodejs";
-export const maxDuration = 300; // for vercel - 300s on Fluid 
+export const maxDuration = 300; // for vercel - 300s on Fluid

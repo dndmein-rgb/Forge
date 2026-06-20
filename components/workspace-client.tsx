@@ -121,6 +121,7 @@ const WorkspaceClient = ({
         const res = await fetch("/api/gen-ai-code", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal:abortController.signal,
           body: JSON.stringify({
             workspaceId: currentWorkspaceId,
             userId,
@@ -190,8 +191,11 @@ const WorkspaceClient = ({
         toast.error(err instanceof Error ? err.message : "Improve failed.");
         setMessages((prev) => prev.slice(0, -2));
       } finally {
-        improveAbortRef.current = null;
-        setIsImproving(false);
+        generateAbortRef.current=null
+        // improveAbortRef.current = null;
+        // setIsImproving(false);
+        setIsGenerating(false);
+        setStatusLog([])
       }
     },
 
@@ -199,6 +203,10 @@ const WorkspaceClient = ({
     [credits, isGenerating, userId],
     // fileData intentionally omitted — read via fileDataRef
   );
+  const handleStop=useCallback(()=>{
+    generateAbortRef.current?.abort();
+    improveAbortRef.current?.abort();
+  },[])
   return (
     <div className="flex h-[calc(100vh-4rem)] overflow-hidden bg-[#0a0a0a]">
       {/* Chat panel - left */}
@@ -214,6 +222,7 @@ const WorkspaceClient = ({
         userId={userId}
         workspaceId={workspaceId}
         appTitle={fileData?.title ?? workspace?.title ?? null}
+        onStop={handleStop}
       />
 
       {/* Code panel - right */}
