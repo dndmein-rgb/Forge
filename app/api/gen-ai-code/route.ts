@@ -15,15 +15,10 @@ function sseEvent(type: string, payload: unknown): string {
 }
 
 // ─── Extract short label from a Gemini thought chunk ─────────────────────────
-// Gemini thoughts often start with a bold heading like **Verify Config**
-// We extract that. If no bold heading, take the first sentence only.
-
 function extractThoughtLabel(text: string): string | null {
-  // Try to grab **bold heading** at the start
   const boldMatch = text.match(/\*\*([^*]{4,60})\*\*/);
   if (boldMatch) return boldMatch[1].trim();
 
-  // Fall back to first sentence (up to first . or \n), capped at 60 chars
   const sentence = text.split(/[.\n]/)[0].trim();
   if (sentence.length >= 8 && sentence.length <= 80) return sentence;
 
@@ -102,7 +97,6 @@ function buildContents(messages: Message[], fileData: FileData | null) {
 
     if (msg.role === "user") {
       const parts: object[] = [];
-
       let text = msg.content;
 
       if (msg.imageUrl) {
@@ -112,7 +106,7 @@ function buildContents(messages: Message[], fileData: FileData | null) {
       const isLast = idx === trimmed.length - 1;
       if (isLast && fileData) {
         text +=
-          "\n\nCurrent project files for context:\n" +
+          "\n\ Current project files for context:\n" +
           JSON.stringify(fileData, null, 2);
       }
 
@@ -122,6 +116,38 @@ function buildContents(messages: Message[], fileData: FileData | null) {
 
     return { role, parts: [{ text: msg.content }] };
   });
+}
+
+// ─── Robust Stream Fetcher with Fallback Strategy ───────────────────────────
+
+async function getGeminiStream(contents: any) {
+  try {
+    // Attempt 1: Call primary Gemini 3.5 Flash
+    return await ai.models.generateContentStream({
+      model: "gemini-3.5-flash",
+      contents,
+      config: {
+        systemInstruction: SYSTEM_PROMPT,
+        temperature: 0.7,
+        responseMimeType: "application/json",
+        thinkingConfig: { includeThoughts: true },
+      },
+    });
+  } catch (primaryError) {
+    console.warn("[Gemini Fallback Triggered] Gemini 3.5 Flash failed or timed out. Trying Gemini 2.5 Flash...", primaryError);
+    
+    // Attempt 2: Switch to backup Gemini 2.5 Flash
+    return await ai.models.generateContentStream({
+      model: "gemini-2.5-flash",
+      contents,
+      config: {
+        systemInstruction: SYSTEM_PROMPT,
+        temperature: 0.7,
+        responseMimeType: "application/json",
+        thinkingConfig: { includeThoughts: true }, 
+      },
+    });
+  }
 }
 
 // ─── Route ────────────────────────────────────────────────────────────────────
@@ -137,22 +163,13 @@ export async function POST(request: NextRequest) {
     workspaceId: string | null;
     messages: Message[];
     fileData: FileData | null;
-    // `userId` is intentionally NOT destructured from the request body.
-    // It must always come from the authenticated `clerkId` lookup below —
-    // never from client input. Trusting a body-supplied userId is what
-    // caused the `Workspace_userId_fkey` violation: the client was sending
-    // an id that doesn't exist in `User`, and workspace.create() tried to
-    // insert a workspace pointing at it.
   };
 
   if (!messages?.length) {
     return Response.json({ message: "No messages provided" }, { status: 400 });
   }
 
-  // ── Arcjet: rate limit, prompt injection, sensitive info ──────────────────
-  // (currently disabled upstream — re-enable by uncommenting the import
-  // and the block below)
-
+  // ── Arcjet protection ──────────────────
   const arcjetReq = new Request(request.url, {
     method: request.method,
     headers: request.headers,
@@ -175,25 +192,20 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // ── Resolve the internal user record from the AUTHENTICATED clerkId only ──
-
+  // ── Resolve user ──
   const user = await db.user.findUnique({
     where: { clerkId },
     select: { id: true, credits: true },
   });
 
-  if (!user)
-    return Response.json({ message: "User not found" }, { status: 404 });
+  if (!user) return Response.json({ message: "User not found" }, { status: 404 });
   if (user.credits < CREDIT_COST_PER_GENERATION) {
     return Response.json({ message: "Insufficient credits" }, { status: 402 });
   }
 
-  const userId = user.id; // ← the ONLY userId used anywhere below
+  const userId = user.id;
 
-  // ── If updating an existing workspace, verify ownership up front ──────────
-  // Fails fast with 404 instead of throwing a Prisma error deep inside the
-  // transaction after an expensive Gemini call has already run.
-
+  // ── Verify workspace ownership ──
   if (workspaceId) {
     const owned = await db.workspace.findFirst({
       where: { id: workspaceId, userId },
@@ -222,21 +234,11 @@ export async function POST(request: NextRequest) {
       try {
         const contents = buildContents(messages, fileData);
 
-        const geminiStream = await ai.models.generateContentStream({
-          model: "gemini-2.5-flash",
-          contents,
-          config: {
-            systemInstruction: SYSTEM_PROMPT,
-            temperature: 0.7,
-            responseMimeType: "application/json",
-            thinkingConfig: {
-              includeThoughts: true,
-            },
-          },
-        });
+        // Uses our new resilient fallback helper function
+        const geminiStream = await getGeminiStream(contents);
 
-        let accumulated = ""; // final JSON output
-        let lastEmitTime = 0; // throttle thought emissions
+        let accumulated = ""; 
+        let lastEmitTime = 0; 
 
         for await (const chunk of geminiStream) {
           const parts = chunk.candidates?.[0]?.content?.parts ?? [];
@@ -260,7 +262,6 @@ export async function POST(request: NextRequest) {
         }
 
         // ── Parse the complete JSON response ──────────────────────────────────
-
         let parsed: {
           assistantMessage: string;
           title?: string;
@@ -295,7 +296,6 @@ export async function POST(request: NextRequest) {
         }
 
         // ── Validate npm packages ──────────────────────────────────────────────
-
         enqueue(sseEvent("status", { message: "Validating packages…" }));
         const { valid: validatedDeps, dropped } = await validateDependencies(
           dependencies ?? {}
@@ -316,7 +316,6 @@ export async function POST(request: NextRequest) {
         };
 
         // ── Upsert workspace + deduct credit (single transaction) ──────────────
-
         enqueue(sseEvent("status", { message: "Saving…" }));
 
         const lastUserMessage = messages[messages.length - 1];
@@ -329,8 +328,6 @@ export async function POST(request: NextRequest) {
           async (tx) => {
             const ws = workspaceId
               ? await tx.workspace.update({
-                  // Ownership already verified above; `id` alone is the
-                  // unique key Prisma needs here.
                   where: { id: workspaceId },
                   data: {
                     messages: updatedMessages as never,
@@ -339,15 +336,13 @@ export async function POST(request: NextRequest) {
                 })
               : await tx.workspace.create({
                   data: {
-                    userId, // ← resolved from clerkId, guaranteed to exist
+                    userId, 
                     title: aiTitle ?? lastUserMessage.content.slice(0, 80),
                     messages: updatedMessages as never,
                     fileData: newFileData as never,
                   },
                 });
 
-            // Guard against the credit balance changing between the
-            // earlier check and now (e.g. a concurrent request).
             const creditUpdate = await tx.user.updateMany({
               where: { id: userId, credits: { gte: CREDIT_COST_PER_GENERATION } },
               data: { credits: { decrement: CREDIT_COST_PER_GENERATION } },
@@ -359,7 +354,7 @@ export async function POST(request: NextRequest) {
 
             return ws;
           },
-          { timeout: 20000 } // 20s, not 200s — see note below
+          { timeout: 20000 }
         );
 
         const updatedUser = await db.user.findUnique({
@@ -368,7 +363,6 @@ export async function POST(request: NextRequest) {
         });
 
         // ── Emit final result ──────────────────────────────────────────────────
-
         enqueue(
           sseEvent("done", {
             workspaceId: workspace.id,
@@ -412,4 +406,4 @@ export async function POST(request: NextRequest) {
 }
 
 export const runtime = "nodejs";
-export const maxDuration = 300; // for vercel - 300s on Fluid
+export const maxDuration = 300;

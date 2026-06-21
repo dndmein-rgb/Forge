@@ -231,6 +231,7 @@ const WorkspaceClient = ({
         isGenerating={isGenerating}
         onFilePatch={handleFilePatch}
         statusLog={statusLog}
+        isImproving={isImproving}
       />
     </div>
   );
