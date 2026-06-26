@@ -324,38 +324,38 @@ export async function POST(request: NextRequest) {
           { role: "assistant", content: assistantMessage },
         ];
 
-        const workspace = await db.$transaction(
-          async (tx) => {
-            const ws = workspaceId
-              ? await tx.workspace.update({
-                  where: { id: workspaceId },
-                  data: {
-                    messages: updatedMessages as never,
-                    fileData: newFileData as never,
-                  },
-                })
-              : await tx.workspace.create({
-                  data: {
-                    userId, 
-                    title: aiTitle ?? lastUserMessage.content.slice(0, 80),
-                    messages: updatedMessages as never,
-                    fileData: newFileData as never,
-                  },
-                });
-
-            const creditUpdate = await tx.user.updateMany({
-              where: { id: userId, credits: { gte: CREDIT_COST_PER_GENERATION } },
-              data: { credits: { decrement: CREDIT_COST_PER_GENERATION } },
-            });
-
-            if (creditUpdate.count === 0) {
-              throw new Error("INSUFFICIENT_CREDITS");
-            }
-
-            return ws;
+       const workspace = await db.$transaction(
+  async (tx) => {
+    const ws = workspaceId
+      ? await tx.workspace.update({
+          where: { id: workspaceId },
+          data: {
+            messages: updatedMessages as never,
+            fileData: newFileData as never,
           },
-          { timeout: 20000 }
-        );
+        })
+      : await tx.workspace.create({
+          data: {
+            userId,
+            title: aiTitle ?? lastUserMessage.content.slice(0, 80),
+            messages: updatedMessages as never,
+            fileData: newFileData as never,
+          },
+        });
+
+    const creditUpdate = await tx.user.updateMany({
+      where: { id: userId, credits: { gte: CREDIT_COST_PER_GENERATION } },
+      data: { credits: { decrement: CREDIT_COST_PER_GENERATION } },
+    });
+
+    if (creditUpdate.count === 0) {
+      throw new Error("INSUFFICIENT_CREDITS");
+    }
+
+    return ws;
+  },
+  { maxWait: 10000, timeout: 15000 }
+);
 
         const updatedUser = await db.user.findUnique({
           where: { id: userId },

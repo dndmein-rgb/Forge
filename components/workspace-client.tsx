@@ -1,7 +1,12 @@
 "use client";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { CodePanel } from "./code-panel";
-import { FileData, Message, StatusStep, WorkspaceData } from "@/types/workspace";
+import {
+  FileData,
+  Message,
+  StatusStep,
+  WorkspaceData,
+} from "@/types/workspace";
 import ChatPanel from "./chat-panel";
 import { MIN_CREDITS_TO_GENERATE } from "@/lib/constants";
 import { toast } from "sonner";
@@ -11,14 +16,14 @@ interface WorkspaceClientProps {
   userCredits: number;
   userId: string;
   userPlan: string;
-  workspace:WorkspaceData | null;
+  workspace: WorkspaceData | null;
 }
 
 function parseMessages(raw: unknown): Message[] {
   if (!Array.isArray(raw)) return [];
   return raw.filter(
     (m): m is Message =>
-      typeof m === "object" && m !== null && "role" in m && "content" in m
+      typeof m === "object" && m !== null && "role" in m && "content" in m,
   );
 }
 
@@ -33,18 +38,19 @@ const WorkspaceClient = ({
   userCredits,
   userId,
   userPlan,
-  workspace
+  workspace,
 }: WorkspaceClientProps) => {
-  const [workspaceId, setWorkspaceId] = useState<string | null>(workspace?.id ?? null);
+  const [workspaceId, setWorkspaceId] = useState<string | null>(
+    workspace?.id ?? null,
+  );
 
   const [messages, setMessages] = useState<Message[]>(
-    parseMessages(workspace?.messages)
+    parseMessages(workspace?.messages),
   );
 
   const [fileData, setFileData] = useState<FileData | null>(
-    parseFileData(workspace?.fileData)
+    parseFileData(workspace?.fileData),
   );
-
 
   const [credits, setCredits] = useState(userCredits);
 
@@ -121,7 +127,7 @@ const WorkspaceClient = ({
         const res = await fetch("/api/gen-ai-code", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          signal:abortController.signal,
+          signal: abortController.signal,
           body: JSON.stringify({
             workspaceId: currentWorkspaceId,
             userId,
@@ -191,11 +197,11 @@ const WorkspaceClient = ({
         toast.error(err instanceof Error ? err.message : "Improve failed.");
         setMessages((prev) => prev.slice(0, -2));
       } finally {
-        generateAbortRef.current=null
+        generateAbortRef.current = null;
         // improveAbortRef.current = null;
         // setIsImproving(false);
         setIsGenerating(false);
-        setStatusLog([])
+        setStatusLog([]);
       }
     },
 
@@ -203,10 +209,135 @@ const WorkspaceClient = ({
     [credits, isGenerating, userId],
     // fileData intentionally omitted — read via fileDataRef
   );
-  const handleStop=useCallback(()=>{
+
+  const handleImprove = useCallback(
+    async (userRequest: string) => {
+      if (isGenerating || isImproving) return;
+      if (credits < MIN_CREDITS_TO_GENERATE) return;
+      if (!workspaceIdRef.current) return;
+
+      // Read fileData from ref — never stale, never causes recreating this fn
+      const currentFileData = fileDataRef.current;
+      if (!currentFileData) return;
+
+      setIsImproving(true);
+
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: userRequest },
+        { role: "assistant", content: "" }, // placeholder, updated live
+      ]);
+
+      // Create a fresh AbortController for this request
+      const abortController = new AbortController();
+      improveAbortRef.current = abortController;
+
+      try {
+        const res = await fetch("/api/improve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: abortController.signal,
+          body: JSON.stringify({
+            userId,
+            workspaceId: workspaceIdRef.current,
+            userRequest,
+            fileData: currentFileData,
+          }),
+        });
+
+        if (res.status === 403) {
+          toast.error(
+            "Upgrade to Starter or Pro to use Improve with Forge Agent.",
+          );
+          setMessages((prev) => prev.slice(0, -2));
+          return;
+        }
+        if (res.status === 402) {
+          toast.error("Not enough credits.");
+          setMessages((prev) => prev.slice(0, -2));
+          return;
+        }
+        if (!res.ok || !res.body) throw new Error("Improve failed");
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let accumulatedThinking = "";
+
+        // Accumulate patches locally — only apply to state at done.
+        // Applying on every file_patch event would update fileData state,
+        // which feeds into SandpackProvider and can cause remounts mid-stream.
+        const localPatches: Record<string, { code: string }> = {};
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            try {
+              const event = JSON.parse(line.slice(6));
+
+              if (event.type === "thinking") {
+                // Stream agent reasoning into the placeholder assistant message
+                accumulatedThinking += event.text;
+                setMessages((prev) => {
+                  const updated = [...prev];
+                  updated[updated.length - 1] = {
+                    role: "assistant",
+                    content: accumulatedThinking,
+                  };
+                  return updated;
+                });
+              } else if (event.type === "file_patch") {
+                // Accumulate locally — don't touch state yet
+                localPatches[event.path] = { code: event.code };
+              } else if (event.type === "done") {
+                // Apply all patches at once now that the stream is complete
+                setFileData(event.fileData);
+                setCredits(event.creditsRemaining);
+                // Replace thinking text with clean summary
+                setMessages((prev) => {
+                  const updated = [...prev];
+                  updated[updated.length - 1] = {
+                    role: "assistant",
+                    content: event.summary,
+                  };
+                  return updated;
+                });
+              } else if (event.type === "error") {
+                throw new Error(event.message);
+              }
+            } catch {
+              // skip malformed SSE lines
+            }
+          }
+        }
+      } catch (err) {
+        // User-initiated stop — silently roll back the user + placeholder messages
+        if (err instanceof Error && err.name === "AbortError") {
+          setMessages((prev) => prev.slice(0, -2));
+          return;
+        }
+        toast.error(err instanceof Error ? err.message : "Improve failed.");
+        setMessages((prev) => prev.slice(0, -2));
+      } finally {
+        improveAbortRef.current = null;
+        setIsImproving(false);
+      }
+    },
+    // fileData intentionally omitted — read via fileDataRef above
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [credits, isGenerating, isImproving, userId],
+  );
+  const handleStop = useCallback(() => {
     generateAbortRef.current?.abort();
     improveAbortRef.current?.abort();
-  },[])
+  }, []);
   return (
     <div className="flex h-[calc(100vh-4rem)] overflow-hidden bg-[#0a0a0a]">
       {/* Chat panel - left */}
@@ -215,7 +346,7 @@ const WorkspaceClient = ({
         credits={userCredits}
         initialPrompt={initialPrompt}
         isGenerating={isGenerating}
-        isImproving={false}
+        isImproving={isImproving}
         messages={messages}
         onGenerate={handleGenerate}
         statusLog={statusLog}
@@ -232,6 +363,14 @@ const WorkspaceClient = ({
         onFilePatch={handleFilePatch}
         statusLog={statusLog}
         isImproving={isImproving}
+        onFixError={(error) =>
+          handleGenerate(
+            `There is an error in the preview:\n\n\`\`\`\n${error}\n\`\`\`\n\nPlease fix it.`,
+          )
+        }
+        isProUser={userPlan === "pro"}
+        appTitle={fileData?.title ?? workspace?.title ?? null}
+        onImprove={handleImprove}
       />
     </div>
   );
